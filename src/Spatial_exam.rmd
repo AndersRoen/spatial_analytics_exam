@@ -1,0 +1,221 @@
+---
+title: "spatial exam"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=TRUE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+We begin with installing and loading the necessary packages
+```{r}
+# Library 
+library(tigris)
+library(raster)
+library(rgeos)
+library(sf)
+library(tidyverse)
+library(htmltools)
+library(mapview)
+library(ggplot2)
+library(tmap)
+library(cartogram)
+library(spdep)
+library(spgwr)
+```
+
+Then, we load in the election dataset acquired from openprecincts.org
+
+```{r}
+TX_votes <- st_read("TX_vtds/TX_vtds.shp")
+
+# get the unique county names
+sort(unique(TX_votes$COUNTY))
+
+```
+
+Then we load in the urban boundaries of the US with the tigris package. Then, using regular expressions we extract the urban divisions of Texas
+```{r}
+
+urban <- urban_areas(year = 2016)
+
+tx_urban <- urban %>% filter(grepl("TX", urban$NAME10))
+
+mapview(TX_votes)
+
+```
+
+Then we make a new object, called tx-elec which groups by county and makes two new columns containing the percentages of votes for the Deomcratic and Republican party respectively. Then we plot an interactive map with mapview() containing the percentages of votes for the Democratic party per county
+```{r}
+sf::sf_use_s2(FALSE)
+
+tx_elec <- TX_votes %>% 
+  group_by(COUNTY) %>% 
+  summarise(sumPRES16D = sum(PRES16D),
+            sumPRES16R = sum(PRES16R),
+            sumTOTAL16 = sum(TOTTO16)) %>% 
+  mutate(pct_vote_dem = sumPRES16D/sumTOTAL16 * 100,
+         pct_vote_rep = sumPRES16R/sumTOTAL16 * 100) 
+
+tx_elec %>% 
+  select(pct_vote_dem) %>% 
+  mapview()
+```
+
+
+Then, we make sure that the tx_urban and the tx_elec object has the same crs. We then incorporate the election data into the urban boundaries, using the st_intersection function. We then make the resulting tx_elec_object into an sf object, and create a convex hull around to allow for plotting
+```{r}
+
+
+st_crs(tx_elec) == st_crs(tx_urban)
+
+tx_urban <- st_transform(tx_urban, st_crs(tx_elec))
+
+tx_elec_urban <- st_intersection(tx_urban, tx_elec)
+
+tx_elec_urban <- st_as_sf(st_convex_hull(tx_elec_urban))
+  
+
+tx_elec_urban %>% 
+  select(pct_vote_dem) %>% 
+  mapview()
+
+
+```
+
+We now have the necessary urban object.
+To get the rural boundaries, we downloaded state boundaries with the tigris package, extracted the Texas boundary, checked the crs's again and used the st_difference function to extract the rural boundaries. Then we used the st_intersection function to incorporate the election data into the rural boundaries. Again, it was made into an sf object with a convex hull to allow for plotting
+
+```{r}
+us <- states(year = 2016)
+
+texas <- us %>% filter(NAME == "Texas")
+
+st_crs(texas) == st_crs(tx_elec)
+
+texas <- st_transform(texas, st_crs(tx_elec))
+
+tx_elec_rural <- texas %>% st_difference(st_union(tx_elec_urban))
+
+tx_elec_rural <- st_intersection(tx_elec, tx_elec_rural)
+
+tx_elec_rural <- st_as_sf(st_convex_hull(tx_elec_rural))
+
+tx_elec_rural %>% 
+  select(pct_vote_dem) %>% 
+  mapview()
+```
+
+
+We then moved on to create the cartogram. The cartogram was made with the percentages of votes for democrats per county as the weights.
+```{r}
+gc()
+
+dem2016 <- cartogram_cont(tx_elec, weight = "pct_vote_dem")
+plot(dem2016$geometry)
+plot(dem2016$pct_vote_dem, st_area(dem2016, byid = TRUE))
+
+
+```
+
+We then moved on to define the neighbors needed for the Monte Carlo test. Here we used queen's adjacency to define neighborhoods which works fine for the rural dataset...
+```{r}
+plot(tx_elec_rural$geometry)
+
+nb1 <- poly2nb(tx_elec_rural$geometry)
+rural_centers <- st_coordinates(st_centroid(tx_elec_rural$geometry))
+
+plot(tx_elec_rural$geometry); plot(nb1, rural_centers, col = "red", add = TRUE)
+
+moran.test(tx_elec_rural$pct_vote_dem,
+           nb2listw(nb1, style = "W",zero.policy=TRUE),
+           zero.policy=TRUE)
+
+moran.mc(tx_elec_rural$pct_vote_dem, nb2listw(nb1, zero.policy=TRUE),zero.policy=TRUE, nsim = 999)
+```
+
+But not so well for the urban dataset
+```{r}
+plot(tx_elec_urban$geometry)
+
+nb2 <- poly2nb(tx_elec_urban$geometry)
+urban_centers <- st_coordinates(st_centroid(tx_elec_urban$geometry))
+
+plot(tx_elec_urban$geometry); plot(nb2, urban_centers, col = "red", add = TRUE)
+
+moran.test(tx_elec_urban$pct_vote_dem,
+           nb2listw(nb2, style = "W",zero.policy=TRUE),
+           zero.policy=TRUE)
+
+moran.mc(tx_elec_urban$pct_vote_dem, nb2listw(nb2, zero.policy=TRUE),zero.policy=TRUE, nsim = 999)
+```
+
+For this reason we went on to define neighbors with k nearest neighbors, in this case with k = 3
+
+```{r}
+k3_tx_rural<- knearneigh(rural_centers, k = 3)
+knb_tx_rural <- knn2nb(knearneigh(rural_centers, k = 3))
+plot(tx_elec_rural$geometry); plot(knb_tx_rural, rural_centers, col = "red",add = TRUE)
+title(main="3 nearest neighbours")
+```
+
+```{r}
+moran.test(tx_elec_rural$pct_vote_dem,
+           nb2listw(knn2nb(k3_tx_rural), style = "W",zero.policy=TRUE),
+           zero.policy=TRUE)
+
+moran.mc(tx_elec_rural$pct_vote_dem,
+           nb2listw(knn2nb(k3_tx_rural), style = "W",zero.policy=TRUE),
+           zero.policy=TRUE, nsim = 999)
+```
+
+
+This works better for the urban dataset
+
+```{r}
+k3_tx_elec_urban <- knearneigh(urban_centers, k = 3)
+knb_tx_elec_urban <- knn2nb(knearneigh(urban_centers, k = 3))
+plot(tx_elec$geometry); plot(knb_tx_elec_urban, urban_centers, col = "red",add = TRUE)
+title(main="3 nearest neighbours")
+```
+
+
+```{r}
+moran.test(tx_elec_urban$pct_vote_dem,
+           nb2listw(knn2nb(k3_tx_elec_urban), style = "W",zero.policy=TRUE),
+           zero.policy=TRUE)
+
+moran.mc(tx_elec_urban$pct_vote_dem,
+           nb2listw(knn2nb(k3_tx_elec_urban), style = "W",zero.policy=TRUE),
+           zero.policy=TRUE, nsim = 999)
+```
+
+
+Finally, we plot heatmaps of the Democratic share of the votes next to the Republican share of the votes
+```{r}
+tx_elec %>% 
+  select(pct_vote_dem | pct_vote_rep) %>% 
+  tm_shape() +
+  tm_polygons(c("pct_vote_dem", "pct_vote_rep"), title = "Percentage of \n votes 2016") 
+
+```
+
+
+
+
+
+
+
+
